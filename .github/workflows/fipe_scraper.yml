@@ -12,7 +12,7 @@ on:
 jobs:
   scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440  # 24 horas máximo
+    timeout-minutes: 1940  # 24 horas máximo
 
     steps:
       - name: Checkout do repositório
