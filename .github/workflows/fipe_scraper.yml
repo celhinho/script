@@ -1,18 +1,17 @@
 # .github/workflows/fipe_scraper.yml
-# Roda o scraper FIPE uma vez por mês (dia 1 às 3h horário de Brasília)
-# Também pode ser disparado manualmente pelo GitHub
+# Roda o scraper FIPE todo dia 1 do mês às 00:01 horário de Brasília (03:01 UTC)
 
 name: FIPE Scraper Mensal
 
 on:
   schedule:
-    - cron: '15 3 1 * *'  # dia 1 de cada mês às 03:15 UTC = 00:15 Brasília
-  workflow_dispatch:      # disparo manual pela interface do GitHub
+    - cron: '1 3 1 * *'   # 00:01 Brasília (UTC-3) = 03:01 UTC
+  workflow_dispatch:       # disparo manual pela interface do GitHub
 
 jobs:
   scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 1940  # 24 horas máximo
+    timeout-minutes: 1440  # 24 horas máximo
 
     steps:
       - name: Checkout do repositório
@@ -24,35 +23,64 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependências
+        run: pip install requests
+
+      - name: Atualizar referência FIPE automaticamente
         run: |
-          pip install requests
+          python3 -c "
+          import requests, json
+
+          resp = requests.post('https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia')
+          tabelas = resp.json()
+
+          # A primeira da lista é sempre a mais recente
+          mais_recente = tabelas[0]
+          codigo = mais_recente['Codigo']
+          mes    = mais_recente['Mes']
+
+          print(f'Referência atual: {codigo} ({mes})')
+
+          # Salva em arquivo para o próximo step
+          with open('referencia_atual.txt', 'w') as f:
+              f.write(str(codigo))
+          "
 
       - name: Executar scraper em modo PRODUÇÃO
         run: |
-          python -c "
+          python3 -c "
           from fipe_scraper_sqlite import ConfigFinal, FipeScraperFinal
+
+          # Lê referência detectada automaticamente
+          with open('referencia_atual.txt') as f:
+              referencia = int(f.read().strip())
+
+          print(f'Rodando com referência: {referencia}')
+
           config = ConfigFinal()
-          config.MODO_TESTE = False
+          config.REFERENCIA       = referencia
+          config.MODO_TESTE       = False
           config.MAX_MARCAS_TESTE = None
           config.MAX_MODELOS_TESTE = None
+
           scraper = FipeScraperFinal(config)
           scraper.executar()
           "
 
-      - name: Upload do banco de dados gerado
+      - name: Upload do banco de dados SQLite
         uses: actions/upload-artifact@v4
-        if: always()  # faz upload mesmo se der erro
+        if: always()   # faz upload mesmo se der erro parcial
         with:
           name: fipe-database-${{ github.run_id }}
           path: |
             fipe_database_v3.db
+            referencia_atual.txt
             logs/
-          retention-days: 30  # mantém por 30 dias
+          retention-days: 90   # fica disponível por 90 dias para download
 
-      - name: Upload do log
+      - name: Upload do log separado
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: fipe-logs-${{ github.run_id }}
           path: logs/fipe_scraper.log
-          retention-days: 30
+          retention-days: 90
