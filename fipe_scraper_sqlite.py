@@ -1,7 +1,7 @@
 
 # fipe_scraper_sqlite.py
 # VERSÃO FINAL - TIMING PERFEITO + SQLITE
-# ATUALIZADO EM FEVEREIRO/2026 - CORREÇÃO DE USER-AGENT E MÉTODOS DE REQUISIÇÃO
+# ATUALIZADO EM maio/O2026 - CORREÇÃO DE USER-AGENT E MÉTODOS DE REQUISIÇÃO
 
 import requests
 import json
@@ -33,7 +33,7 @@ class TimingPerfeito:
 class ConfigFinal:
     """Configuração final otimizada"""
     BASE_URL = "https://veiculos.fipe.org.br/api/veiculos"
-    REFERENCIA = 332  # abril 2026
+    REFERENCIA = 333  # maio 2026
     
     TIPOS_VEICULO = [
         {'id': 1, 'nome': 'carros'},
