@@ -1,0 +1,7 @@
+﻿*.db
+*.sqlite
+logs/
+__pycache__/
+*.pyc
+temp_upload_*.sql
+node_modules/

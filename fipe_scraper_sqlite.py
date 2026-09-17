@@ -2,7 +2,12 @@
 # COLETOR OFICIAL FIPE + MODO SENTINELA AUTOMÁTICO 24/7 + CLOUDFLARE D1
 # Versão com detecção contínua de novas referências (312 -> 338 em diante)
 
-import requests
+try:
+    from curl_cffi import requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    import requests
+    HAS_CURL_CFFI = False
 import json
 import time
 import os
@@ -162,13 +167,20 @@ class FipeColetor:
         self.timing = TimingPerfeito()
         self.db = GerenciadorSQLite(Config.DATABASE_FILE)
         
-        self.session = requests.Session()
+        if HAS_CURL_CFFI:
+            self.session = requests.Session(impersonate="chrome120")
+        else:
+            self.session = requests.Session()
+            self.session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            })
+
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/json",
             "Origin": "https://veiculos.fipe.org.br",
-            "Referer": "https://veiculos.fipe.org.br/"
+            "Referer": "https://veiculos.fipe.org.br/",
+            "X-Requested-With": "XMLHttpRequest"
         })
         
         self.ultima_requisicao = 0
@@ -430,7 +442,15 @@ class SincronizadorD1:
 # ==================== MODO SENTINELA (24/7) ====================
 def obter_todas_referencias_fipe() -> List[Dict]:
     try:
-        r = requests.post("https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia", timeout=10)
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Referer": "https://veiculos.fipe.org.br/",
+            "X-Requested-With": "XMLHttpRequest"
+        }
+        if HAS_CURL_CFFI:
+            r = requests.post("https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia", timeout=10, impersonate="chrome120", headers=headers)
+        else:
+            r = requests.post("https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia", timeout=10, headers=headers)
         if r.status_code == 200:
             return r.json() or []
     except Exception as e:

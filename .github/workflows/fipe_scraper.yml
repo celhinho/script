@@ -38,7 +38,7 @@ jobs:
 
       - name: Instalar dependências Python e Wrangler
         run: |
-          pip install requests
+          pip install requests curl_cffi
           npm install -g wrangler
 
       - name: Executar Scraper e Sincronizar com Cloudflare D1
