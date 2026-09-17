@@ -19,29 +19,19 @@ on:
 
 jobs:
   scraper:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360 # Limite do GitHub Actions (6 horas)
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 360
 
     steps:
       - name: Checkout do repositório
         uses: actions/checkout@v4
 
-      - name: Configurar Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Configurar Node.js (para Wrangler Cloudflare)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Instalar dependências Python e Wrangler
+      - name: Instalar dependências Python
         run: |
           pip install requests curl_cffi
-          npm install -g wrangler
 
       - name: Executar Scraper e Sincronizar com Cloudflare D1
+        shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: 5c8e4a0bd11a70249ab3d57cfa3c2d4a
@@ -53,7 +43,7 @@ jobs:
           if [ -n "${{ inputs.referencia }}" ]; then
             ARGS="$ARGS --ref ${{ inputs.referencia }}"
           fi
-          python3 fipe_scraper_sqlite.py $ARGS
+          python fipe_scraper_sqlite.py $ARGS
 
       - name: Fazer backup do banco SQLite nos artefatos do GitHub
         uses: actions/upload-artifact@v4
