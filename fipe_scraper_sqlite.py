@@ -182,6 +182,12 @@ class FipeColetor:
             "Referer": "https://veiculos.fipe.org.br/",
             "X-Requested-With": "XMLHttpRequest"
         })
+
+        try:
+            r_init = self.session.get("https://veiculos.fipe.org.br", timeout=10)
+            logging.info(f"Inicializando sessão FIPE: Status {r_init.status_code}, Cookies: {dict(self.session.cookies)}")
+        except Exception as e:
+            logging.warning(f"Aviso ao inicializar sessão: {e}")
         
         self.ultima_requisicao = 0
         self.contador_batch = 0
@@ -232,7 +238,7 @@ class FipeColetor:
                             txt = txt[2:]
                         return json.loads(txt)
                 else:
-                    self.logger.warning(f"HTTP {resp.status_code} em {endpoint}. Tentando novamente...")
+                    self.logger.warning(f"HTTP {resp.status_code} em {endpoint} (cf-ray: {resp.headers.get('cf-ray', 'N/A')}) | Detalhes: {resp.text[:200].strip().replace(chr(10), ' ')}")
                     time.sleep(2)
             except Exception as e:
                 self.logger.debug(f"Erro na tentativa {tentativa+1}: {e}")
