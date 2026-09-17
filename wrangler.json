@@ -1,0 +1,10 @@
+{
+  "name": "fipe-scraper",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fipe",
+      "database_id": "4945cb35-bab7-4086-bc36-938d57410a4e"
+    }
+  ]
+}

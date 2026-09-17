@@ -1,17 +1,26 @@
-# .github/workflows/fipe_scraper.yml
-# Roda o scraper FIPE todo dia 1 do mês às 00:01 horário de Brasília (03:01 UTC)
-
-name: FIPE Scraper Mensal
+name: FIPE Scraper Cloudflare D1
 
 on:
   schedule:
-    - cron: '1 3 1 * *'   # 00:01 Brasília (UTC-3) = 03:01 UTC
-  workflow_dispatch:       # disparo manual pela interface do GitHub
+    # Roda todo dia 1 e dia 2 de cada mês às 02:00 BRT (05:00 UTC)
+    - cron: '0 5 1,2 * *'
+  workflow_dispatch:
+    inputs:
+      modo_teste:
+        description: 'Rodar em Modo Teste Rápido (1 marca / 2 modelos)?'
+        required: false
+        type: boolean
+        default: false
+      referencia:
+        description: 'Referência específica (vazio para detectar o mês atual da FIPE)'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440  # 24 horas máximo
+    timeout-minutes: 360 # Limite do GitHub Actions (6 horas)
 
     steps:
       - name: Checkout do repositório
@@ -22,65 +31,36 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Instalar dependências
-        run: pip install requests
-
-      - name: Atualizar referência FIPE automaticamente
-        run: |
-          python3 -c "
-          import requests, json
-
-          resp = requests.post('https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia')
-          tabelas = resp.json()
-
-          # A primeira da lista é sempre a mais recente
-          mais_recente = tabelas[0]
-          codigo = mais_recente['Codigo']
-          mes    = mais_recente['Mes']
-
-          print(f'Referência atual: {codigo} ({mes})')
-
-          # Salva em arquivo para o próximo step
-          with open('referencia_atual.txt', 'w') as f:
-              f.write(str(codigo))
-          "
-
-      - name: Executar scraper em modo PRODUÇÃO
-        run: |
-          python3 -c "
-          from fipe_scraper_sqlite import ConfigFinal, FipeScraperFinal
-
-          # Lê referência detectada automaticamente
-          with open('referencia_atual.txt') as f:
-              referencia = int(f.read().strip())
-
-          print(f'Rodando com referência: {referencia}')
-
-          config = ConfigFinal()
-          config.REFERENCIA       = referencia
-          config.MODO_TESTE       = False
-          config.MAX_MARCAS_TESTE = None
-          config.MAX_MODELOS_TESTE = None
-
-          scraper = FipeScraperFinal(config)
-          scraper.executar()
-          "
-
-      - name: Upload do banco de dados SQLite
-        uses: actions/upload-artifact@v4
-        if: always()   # faz upload mesmo se der erro parcial
+      - name: Configurar Node.js (para Wrangler Cloudflare)
+        uses: actions/setup-node@v4
         with:
-          name: fipe-database-${{ github.run_id }}
-          path: |
-            fipe_database_v3.db
-            referencia_atual.txt
-            logs/
-          retention-days: 90   # fica disponível por 90 dias para download
+          node-version: '20'
 
-      - name: Upload do log separado
+      - name: Instalar dependências Python e Wrangler
+        run: |
+          pip install requests
+          npm install -g wrangler
+
+      - name: Executar Scraper e Sincronizar com Cloudflare D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 5c8e4a0bd11a70249ab3d57cfa3c2d4a
+        run: |
+          ARGS="--executar"
+          if [ "${{ inputs.modo_teste }}" = "true" ]; then
+            ARGS="$ARGS --modo-teste"
+          fi
+          if [ -n "${{ inputs.referencia }}" ]; then
+            ARGS="$ARGS --ref ${{ inputs.referencia }}"
+          fi
+          python3 fipe_scraper_sqlite.py $ARGS
+
+      - name: Fazer backup do banco SQLite nos artefatos do GitHub
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: fipe-logs-${{ github.run_id }}
-          path: logs/fipe_scraper.log
-          retention-days: 90
+          name: fipe-sqlite-backup-${{ github.run_id }}
+          path: |
+            fipe_database_v3.db
+            logs/
+          retention-days: 30

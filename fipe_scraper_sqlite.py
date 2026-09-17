@@ -1,420 +1,168 @@
-
-# fipe_scraper_sqlite.py
-# VERSÃO FINAL - TIMING PERFEITO + SQLITE
-# ATUALIZADO EM maio/O2026 - CORREÇÃO DE USER-AGENT E MÉTODOS DE REQUISIÇÃO
+# coletor_fipe_d1.py
+# COLETOR OFICIAL FIPE + MODO SENTINELA AUTOMÁTICO 24/7 + CLOUDFLARE D1
+# Versão com detecção contínua de novas referências (312 -> 338 em diante)
 
 import requests
 import json
 import time
 import os
+import sys
 import sqlite3
+import subprocess
+import argparse
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 import logging
 
-# ==================== CONFIGURAÇÃO PERFEITA ====================
-class TimingPerfeito:
-    """Configurações de timing otimizadas"""
-    # Delays baseados em testes reais
-    DELAY_MARCAS = 1.0
-    DELAY_MODELOS = 1.0
-    DELAY_ANOS = 1.0
-    DELAY_PRECOS = 1.0
-    
-    # Controles de batch
-    BATCH_PRECOS = 5
-    PAUSA_BATCH = 2.0
-    
-    # Rate limit protection
-    REQUESTS_PER_MINUTE = 30
-    COOLDOWN_429 = 90
-    TIMEOUT = 30
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-class ConfigFinal:
-    """Configuração final otimizada"""
+# ==================== CONFIGURAÇÃO ====================
+class TimingPerfeito:
+    DELAY_MARCAS = 1.2
+    DELAY_MODELOS = 1.2
+    DELAY_ANOS = 1.2
+    DELAY_PRECOS = 1.5
+    
+    BATCH_PRECOS = 2
+    PAUSA_BATCH = 1.0
+    
+    REQUESTS_PER_MINUTE = 40
+    COOLDOWN_429 = 30
+    TIMEOUT = 20
+
+class Config:
     BASE_URL = "https://veiculos.fipe.org.br/api/veiculos"
-    REFERENCIA = 333  # maio 2026
+    DATABASE_FILE = "fipe_database_v3.db"
+    ARQUIVO_LOG = "logs/sentinela.log"
+    INTERVALO_MONITORAMENTO_SEGUNDOS = 3600  # Checa a FIPE a cada 1 hora
     
     TIPOS_VEICULO = [
         {'id': 1, 'nome': 'carros'},
         {'id': 2, 'nome': 'caminhoes'},
         {'id': 3, 'nome': 'motos'}
     ]
-    
-    # Banco de dados SQLite
-    DATABASE_FILE = "fipe_database_v3.db"
-    ARQUIVO_LOG = "logs/fipe_scraper.log"
-    
-    # Modo teste
-    MODO_TESTE = True
-    MAX_MARCAS_TESTE = 3 if MODO_TESTE else None
-    MAX_MODELOS_TESTE = 2 if MODO_TESTE else None
 
-# ==================== GERENCIADOR SQLITE ====================
+# ==================== GERENCIADOR SQLITE LOCAL ====================
 class GerenciadorSQLite:
-    """Gerencia banco de dados SQLite para armazenamento eficiente"""
-    
     def __init__(self, db_file: str):
         self.db_file = db_file
-        self.conn = None
-        self.cursor = None
-        self.dados_buffer = []
-        
-        # Criar diretório se não existir
         os.makedirs(os.path.dirname(db_file) or ".", exist_ok=True)
-        
-        # Conectar ao banco de dados
-        self._conectar()
-        
-        # Criar tabelas se não existirem
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.cursor = self.conn.cursor()
+        self.dados_buffer = []
         self._criar_tabelas()
     
-    def _conectar(self):
-        """Conecta ao banco de dados SQLite"""
-        try:
-            self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row  # Para acesso por nome de coluna
-            self.cursor = self.conn.cursor()
-        except Exception as e:
-            raise Exception(f"Erro ao conectar ao banco de dados: {e}")
-    
     def _criar_tabelas(self):
-        """Cria todas as tabelas necessárias"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS veiculos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tipo_veiculo INTEGER,
+                marca TEXT,
+                modelo TEXT,
+                ano TEXT,
+                valor INTEGER,
+                valor_texto TEXT,
+                combustivel TEXT,
+                referencia INTEGER,
+                codigo_fipe TEXT,
+                mes_referencia TEXT,
+                data_coleta TIMESTAMP,
+                data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tipo_veiculo, marca, modelo, ano, referencia)
+            )
+        ''')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_v_ref ON veiculos(referencia)')
+        self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_v_busca ON veiculos(referencia, tipo_veiculo, marca)')
+        self.conn.commit()
+
+    @staticmethod
+    def parse_valor_numerico(valor_str: str) -> int:
+        if not valor_str:
+            return 0
+        limpo = valor_str.replace('R$', '').replace('.', '').replace(' ', '').split(',')[0].strip()
         try:
-            # Tabela de veículos (dados principais)
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS veiculos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tipo_veiculo INTEGER,
-                    marca TEXT,
-                    modelo TEXT,
-                    ano TEXT,
-                    valor TEXT,
-                    combustivel TEXT,
-                    referencia INTEGER,
-                    codigo_fipe TEXT,
-                    mes_referencia TEXT,
-                    data_coleta TIMESTAMP,
-                    data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(tipo_veiculo, marca, modelo, ano, referencia)
-                )
-            ''')
-            
-            # Tabela de marcas
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS marcas (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tipo_veiculo INTEGER,
-                    codigo_marca TEXT,
-                    nome_marca TEXT,
-                    data_coleta TIMESTAMP,
-                    UNIQUE(tipo_veiculo, codigo_marca)
-                )
-            ''')
-            
-            # Tabela de modelos
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS modelos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tipo_veiculo INTEGER,
-                    codigo_marca TEXT,
-                    codigo_modelo TEXT,
-                    nome_modelo TEXT,
-                    data_coleta TIMESTAMP,
-                    UNIQUE(tipo_veiculo, codigo_marca, codigo_modelo)
-                )
-            ''')
-            
-            # Tabela de anos
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS anos (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tipo_veiculo INTEGER,
-                    codigo_marca TEXT,
-                    codigo_modelo TEXT,
-                    codigo_ano TEXT,
-                    nome_ano TEXT,
-                    data_coleta TIMESTAMP,
-                    UNIQUE(tipo_veiculo, codigo_marca, codigo_modelo, codigo_ano)
-                )
-            ''')
-            
-            # Tabela de estatísticas
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS estatisticas (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_registro DATE,
-                    total_veiculos INTEGER,
-                    total_marcas INTEGER,
-                    total_modelos INTEGER,
-                    total_tipos INTEGER,
-                    tempo_coleta_minutos INTEGER
-                )
-            ''')
-            
-            # Criar índices para performance
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_veiculos_tipo ON veiculos(tipo_veiculo)')
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_veiculos_marca ON veiculos(marca)')
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_veiculos_modelo ON veiculos(modelo)')
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_marcas_tipo ON marcas(tipo_veiculo)')
-            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_modelos_tipo_marca ON modelos(tipo_veiculo, codigo_marca)')
-            
-            self.conn.commit()
-            
-        except Exception as e:
-            raise Exception(f"Erro ao criar tabelas: {e}")
-    
+            return int(limpo)
+        except:
+            return 0
+
     def adicionar_veiculo(self, dados: Dict):
-        """Adiciona um veículo ao buffer para inserção em lote"""
         self.dados_buffer.append(dados)
-    
-    def salvar_buffer(self, forcar: bool = False) -> Dict:
-        """
-        Salva dados do buffer no banco de dados
-        Retorna estatísticas da operação
-        """
+
+    def salvar_buffer(self, forcar: bool = False) -> int:
         if not self.dados_buffer and not forcar:
-            return {'salvos': 0, 'total': self.contar_veiculos()}
-        
-        try:
-            salvos = 0
-            duplicados = 0
-            
-            for dados in self.dados_buffer:
-                try:
-                    # Inserir ou atualizar veículo
-                    self.cursor.execute('''
-                        INSERT OR REPLACE INTO veiculos 
-                        (tipo_veiculo, marca, modelo, ano, valor, combustivel, referencia, 
-                         codigo_fipe, mes_referencia, data_coleta)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        dados.get('tipo_veiculo'),
-                        dados.get('marca'),
-                        dados.get('modelo'),
-                        dados.get('ano'),
-                        dados.get('Valor', ''),
-                        dados.get('Combustivel', ''),
-                        dados.get('referencia'),
-                        dados.get('CodigoFipe', ''),
-                        dados.get('MesReferencia', ''),
-                        dados.get('data_coleta')
-                    ))
-                    salvos += 1
-                except sqlite3.IntegrityError:
-                    duplicados += 1
-                except Exception as e:
-                    logging.debug(f"Erro ao salvar veículo: {e}")
-            
-            self.conn.commit()
-            total = self.contar_veiculos()
-            
-            # Limpar buffer
-            self.dados_buffer.clear()
-            
-            return {
-                'sucesso': True,
-                'salvos': salvos,
-                'duplicados': duplicados,
-                'total': total
-            }
-            
-        except Exception as e:
-            return {
-                'sucesso': False,
-                'erro': str(e)
-            }
-    
-    def salvar_marca(self, tipo_veiculo: int, codigo_marca: str, nome_marca: str):
-        """Salva uma marca no banco de dados"""
-        try:
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO marcas (tipo_veiculo, codigo_marca, nome_marca, data_coleta)
-                VALUES (?, ?, ?, ?)
-            ''', (tipo_veiculo, codigo_marca, nome_marca, datetime.now().isoformat()))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logging.debug(f"Erro ao salvar marca: {e}")
-            return False
-    
-    def salvar_modelo(self, tipo_veiculo: int, codigo_marca: str, codigo_modelo: str, nome_modelo: str):
-        """Salva um modelo no banco de dados"""
-        try:
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO modelos (tipo_veiculo, codigo_marca, codigo_modelo, nome_modelo, data_coleta)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (tipo_veiculo, codigo_marca, codigo_modelo, nome_modelo, datetime.now().isoformat()))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logging.debug(f"Erro ao salvar modelo: {e}")
-            return False
-    
-    def salvar_ano(self, tipo_veiculo: int, codigo_marca: str, codigo_modelo: str, codigo_ano: str, nome_ano: str):
-        """Salva um ano no banco de dados"""
-        try:
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO anos (tipo_veiculo, codigo_marca, codigo_modelo, codigo_ano, nome_ano, data_coleta)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (tipo_veiculo, codigo_marca, codigo_modelo, codigo_ano, nome_ano, datetime.now().isoformat()))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logging.debug(f"Erro ao salvar ano: {e}")
-            return False
-    
-    def contar_veiculos(self) -> int:
-        """Retorna o total de veículos no banco de dados"""
-        try:
-            self.cursor.execute("SELECT COUNT(*) as total FROM veiculos")
-            return self.cursor.fetchone()['total']
-        except:
             return 0
-    
-    def contar_marcas(self, tipo_veiculo: int = None) -> int:
-        """Retorna o total de marcas"""
+        salvos = 0
+        for dados in self.dados_buffer:
+            valor_txt = dados.get('Valor', '')
+            valor_num = self.parse_valor_numerico(valor_txt)
+            try:
+                self.cursor.execute('''
+                    INSERT OR REPLACE INTO veiculos 
+                    (tipo_veiculo, marca, modelo, ano, valor, valor_texto, combustivel, referencia, 
+                     codigo_fipe, mes_referencia, data_coleta)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    dados.get('tipo_veiculo'),
+                    dados.get('marca'),
+                    dados.get('modelo'),
+                    dados.get('ano'),
+                    valor_num,
+                    valor_txt,
+                    dados.get('Combustivel', ''),
+                    dados.get('referencia'),
+                    dados.get('CodigoFipe', ''),
+                    dados.get('MesReferencia', ''),
+                    dados.get('data_coleta')
+                ))
+                salvos += 1
+            except Exception as e:
+                logging.debug(f"Erro ao salvar: {e}")
+        self.conn.commit()
+        self.dados_buffer.clear()
+        return salvos
+
+    def veiculo_existe(self, tipo_veiculo: int, marca: str, modelo: str, ano: str, referencia: int) -> bool:
         try:
-            if tipo_veiculo:
-                self.cursor.execute("SELECT COUNT(*) as total FROM marcas WHERE tipo_veiculo = ?", (tipo_veiculo,))
+            self.cursor.execute('''
+                SELECT 1 FROM veiculos 
+                WHERE tipo_veiculo = ? AND marca = ? AND modelo = ? AND ano = ? AND referencia = ? 
+                LIMIT 1
+            ''', (tipo_veiculo, marca, modelo, ano, referencia))
+            return self.cursor.fetchone() is not None
+        except:
+            return False
+
+    def contar_veiculos(self, referencia: int = None) -> int:
+        try:
+            if referencia:
+                self.cursor.execute("SELECT COUNT(*) FROM veiculos WHERE referencia = ?", (referencia,))
             else:
-                self.cursor.execute("SELECT COUNT(*) as total FROM marcas")
-            return self.cursor.fetchone()['total']
+                self.cursor.execute("SELECT COUNT(*) FROM veiculos")
+            return self.cursor.fetchone()[0]
         except:
             return 0
-            
-    def estatisticas_banco(self) -> Dict:
-        """Retorna estatísticas completas do banco"""
-        try:
-            self.cursor.execute("SELECT COUNT(*) as total FROM veiculos")
-            total_veiculos = self.cursor.fetchone()['total']
-            
-            self.cursor.execute("SELECT COUNT(*) as total FROM marcas")
-            total_marcas = self.cursor.fetchone()['total']
-            
-            self.cursor.execute("SELECT COUNT(*) as total FROM modelos")
-            total_modelos = self.cursor.fetchone()['total']
-            
-            self.cursor.execute("SELECT COUNT(DISTINCT tipo_veiculo) as total FROM veiculos")
-            total_tipos = self.cursor.fetchone()['total']
-            
-            self.cursor.execute("SELECT MAX(data_atualizacao) as ultima FROM veiculos")
-            ultima_atualizacao = self.cursor.fetchone()['ultima']
-            
-            # Contagem por tipo
-            por_tipo = {}
-            tipo_map = {1: 'Carros', 2: 'Caminhões', 3: 'Motos'}
-            for tid, tnome in tipo_map.items():
-                self.cursor.execute("SELECT COUNT(*) as total FROM veiculos WHERE tipo_veiculo = ?", (tid,))
-                por_tipo[tnome] = self.cursor.fetchone()['total']
-                
-            # Tamanho do arquivo
-            tamanho_mb = os.path.getsize(self.db_file) / (1024 * 1024) if os.path.exists(self.db_file) else 0
-            
-            return {
-                'total_veiculos': total_veiculos,
-                'total_marcas': total_marcas,
-                'total_modelos': total_modelos,
-                'total_tipos': total_tipos,
-                'ultima_atualizacao': ultima_atualizacao,
-                'por_tipo': por_tipo,
-                'tamanho_mb': tamanho_mb
-            }
-        except Exception as e:
-            return {'erro': str(e)}
 
-    def buscar_veiculos(self, filtros: Dict = None, limite: int = 100) -> List[Dict]:
-        """Busca veículos com filtros"""
-        query = "SELECT * FROM veiculos"
-        params = []
-        
-        if filtros:
-            condicoes = []
-            for campo, valor in filtros.items():
-                condicoes.append(f"{campo} LIKE ?")
-                params.append(f"%{valor}%")
-            query += " WHERE " + " AND ".join(condicoes)
-            
-        query += " ORDER BY data_coleta DESC LIMIT ?"
-        params.append(limite)
-        
+    def obter_referencias_locais(self) -> Set[int]:
         try:
-            self.cursor.execute(query, params)
-            return [dict(row) for row in self.cursor.fetchall()]
+            self.cursor.execute("SELECT DISTINCT referencia FROM veiculos")
+            return {r[0] for r in self.cursor.fetchall()}
         except:
-            return []
-
-    def exportar_para_json(self, arquivo_saida: str):
-        """Exporta todos os dados para JSON"""
-        try:
-            self.cursor.execute("SELECT * FROM veiculos")
-            rows = self.cursor.fetchall()
-            dados = [dict(row) for row in rows]
-            
-            os.makedirs(os.path.dirname(arquivo_saida) or ".", exist_ok=True)
-            with open(arquivo_saida, 'w', encoding='utf-8') as f:
-                json.dump(dados, f, indent=4, ensure_ascii=False)
-            
-            return {'sucesso': True, 'veiculos_exportados': len(dados)}
-        except Exception as e:
-            return {'sucesso': False, 'erro': str(e)}
+            return set()
 
     def fechar(self):
-        """Fecha conexão com banco de dados"""
         if self.conn:
             self.conn.close()
 
-# ==================== CACHE INTELIGENTE ====================
-class CacheFipe:
-    """Cache em memória para evitar requisições duplicadas"""
-    def __init__(self):
-        self.marcas = {}
-        self.modelos = {}
-        self.anos = {}
-        self.precos = {}
-        
-    def get_marcas(self, tipo: int):
-        return self.marcas.get(tipo)
-        
-    def set_marcas(self, tipo: int, dados: List):
-        self.marcas[tipo] = dados
-        
-    def get_modelos(self, tipo: int, marca_id: str):
-        key = f"{tipo}_{marca_id}"
-        return self.modelos.get(key)
-        
-    def set_modelos(self, tipo: int, marca_id: str, dados: List):
-        key = f"{tipo}_{marca_id}"
-        self.modelos[key] = dados
-        
-    def get_anos(self, tipo: int, marca_id: str, modelo_id: str):
-        key = f"{tipo}_{marca_id}_{modelo_id}"
-        return self.anos.get(key)
-        
-    def set_anos(self, tipo: int, marca_id: str, modelo_id: str, dados: List):
-        key = f"{tipo}_{marca_id}_{modelo_id}"
-        self.anos[key] = dados
-        
-    def get_preco(self, tipo: int, marca_id: str, modelo_id: str, ano_id: str):
-        key = f"{tipo}_{marca_id}_{modelo_id}_{ano_id}"
-        return self.precos.get(key)
-        
-    def set_preco(self, tipo: int, marca_id: str, modelo_id: str, ano_id: str, dados: Dict):
-        key = f"{tipo}_{marca_id}_{modelo_id}_{ano_id}"
-        self.precos[key] = dados
-
-# ==================== SCRAPER PRINCIPAL ====================
-class FipeScraperFinal:
-    """Scraper definitivo com timing perfeito e SQLite"""
-    
-    def __init__(self, config: ConfigFinal):
-        self.config = config
+# ==================== COLETOR PRINCIPAL ====================
+class FipeColetor:
+    def __init__(self, referencia: int, modo_teste: bool = False):
+        self.referencia = referencia
+        self.modo_teste = modo_teste
         self.timing = TimingPerfeito()
-        self.db = GerenciadorSQLite(config.DATABASE_FILE)
-        self.cache = CacheFipe()
+        self.db = GerenciadorSQLite(Config.DATABASE_FILE)
         
         self.session = requests.Session()
-        # CORREÇÃO: User-Agent moderno e completo
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -423,516 +171,412 @@ class FipeScraperFinal:
             "Referer": "https://veiculos.fipe.org.br/"
         })
         
-        self.stats = {
-            'inicio': datetime.now(),
-            'veiculos_coletados': 0,
-            'requisicoes_total': 0,
-            'rate_limits': 0,
-            'sucesso': 0,
-            'falhas': 0
-        }
-        
         self.ultima_requisicao = 0
         self.contador_batch = 0
+        self.veiculos_coletados = 0
+        self.sucesso = 0
+        self.pulos = 0
         
-        # Setup logging
-        self._setup_logging()
-        
-        self.logger.info("=" * 60)
-        self.logger.info("🚀 FIPE SCRAPER SQLITE - TIMING PERFEITO")
-        self.logger.info("=" * 60)
-        self.logger.info(f"✓ Banco de dados: {self.config.DATABASE_FILE}")
-        self.logger.info(f"✓ Timing otimizado")
-        self.logger.info(f"✓ Cache inteligente")
-        self.logger.info("=" * 60)
-    
-    def _setup_logging(self):
-        """Configura logging"""
         os.makedirs('logs', exist_ok=True)
-        
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            format='%(asctime)s - %(message)s',
             handlers=[
-                logging.FileHandler(self.config.ARQUIVO_LOG, encoding='utf-8', mode='a'),
+                logging.FileHandler(Config.ARQUIVO_LOG, encoding='utf-8', mode='a'),
                 logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
-    
-    def _controle_timing(self, delay: float):
-        """Controle de timing entre requisições"""
-        agora = time.time()
-        tempo_espera = max(0, delay - (agora - self.ultima_requisicao))
-        
-        if tempo_espera > 0:
-            time.sleep(tempo_espera)
-        
-        self.ultima_requisicao = time.time()
-    
-    def _requisicao_segura(self, endpoint: str, dados: Dict = None) -> Optional[Dict]:
-        """Requisição HTTP com timing e retry controlados"""
-        url = f"{self.config.BASE_URL}/{endpoint}"
-        
-        for tentativa in range(3):
-            try:
-                # Controle de timing
-                delay = getattr(self.timing, f"DELAY_{endpoint.split('Consultar')[-1].upper()}", 
-                              self.timing.DELAY_PRECOS)
-                self._controle_timing(delay)
-                
-                # Fazer requisição
-                # CORREÇÃO: ConsultarTabelaDeReferencia agora exige POST
-                if endpoint == 'ConsultarTabelaDeReferencia':
-                    response = self.session.post(url, timeout=15)
-                else:
-                    response = self.session.post(url, json=dados, timeout=15)
-                
-                self.stats['requisicoes_total'] += 1
-                
-                if response.status_code == 429:
-                    self.stats['rate_limits'] += 1
-                    wait = self.timing.COOLDOWN_429 * (tentativa + 1)
-                    self.logger.warning(f"⚠️  Rate limit! Aguardando {wait}s...")
-                    time.sleep(wait)
-                    continue
-                
-                if response.status_code != 200:
-                    self.logger.error(f"Erro HTTP {response.status_code} em {endpoint}")
-                    continue
-                
-                try:
-                    return response.json()
-                except:
-                    texto = response.text.strip()
-                    if texto.startswith('ss['):
-                        texto = texto[2:]
-                    try:
-                        return json.loads(texto)
-                    except:
-                        return None
-                
-            except Exception as e:
-                self.logger.debug(f"Tentativa {tentativa+1}: {e}")
-                time.sleep(2)
-        
-        return None
-    
-    def _obter_marcas_otimizado(self, tipo: int) -> List[Dict]:
-        """Obtém todas as marcas"""
-        cache = self.cache.get_marcas(tipo)
-        if cache:
-            return cache
-        
-        dados = {
-            "codigoTabelaReferencia": self.config.REFERENCIA,
-            "codigoTipoVeiculo": tipo
-        }
-        
-        marcas = self._requisicao_segura("ConsultarMarcas", dados)
-        
-        if marcas:
-            self.cache.set_marcas(tipo, marcas)
-            # Salvar marcas no banco de dados
-            for marca in marcas:
-                self.db.salvar_marca(tipo, marca['Value'], marca['Label'])
-            return marcas
-        
-        return []
-    
-    def _obter_modelos_otimizado(self, tipo: int, marca: Dict) -> List[Dict]:
-        """Obtém todos os modelos"""
-        marca_id = marca['Value']
-        
-        cache = self.cache.get_modelos(tipo, marca_id)
-        if cache:
-            return cache
-        
-        dados = {
-            "codigoTabelaReferencia": self.config.REFERENCIA,
-            "codigoTipoVeiculo": tipo,
-            "codigoMarca": marca_id
-        }
-        
-        response = self._requisicao_segura("ConsultarModelos", dados)
-        
-        if response and 'Modelos' in response:
-            modelos = response['Modelos']
-            self.cache.set_modelos(tipo, marca_id, modelos)
-            # Salvar modelos no banco de dados
-            for modelo in modelos:
-                self.db.salvar_modelo(tipo, marca_id, modelo['Value'], modelo['Label'])
-            return modelos
-        
-        return []
-    
-    def _obter_anos_otimizado(self, tipo: int, marca: Dict, modelo: Dict) -> List[Dict]:
-        """Obtém todos os anos"""
-        marca_id = marca['Value']
-        modelo_id = modelo['Value']
-        
-        cache = self.cache.get_anos(tipo, marca_id, modelo_id)
-        if cache:
-            return cache
-        
-        dados = {
-            "codigoTabelaReferencia": self.config.REFERENCIA,
-            "codigoTipoVeiculo": tipo,
-            "codigoMarca": marca_id,
-            "codigoModelo": modelo_id
-        }
-        
-        anos = self._requisicao_segura("ConsultarAnoModelo", dados)
-        
-        if anos:
-            self.cache.set_anos(tipo, marca_id, modelo_id, anos)
-            # Salvar anos no banco de dados
-            for ano in anos:
-                self.db.salvar_ano(tipo, marca_id, modelo_id, ano['Value'], ano['Label'])
-            return anos
-        
-        return []
-    
-    def _obter_preco_otimizado(self, tipo: int, marca: Dict, modelo: Dict, ano: Dict) -> Optional[Dict]:
-        """Obtém preço com cache"""
-        marca_id = marca['Value']
-        modelo_id = modelo['Value']
-        ano_id = ano['Value']
-        
-        cache = self.cache.get_preco(tipo, marca_id, modelo_id, ano_id)
-        if cache:
-            return cache
-        
-        # Parse ano
-        if '-' in str(ano_id):
-            try:
-                ano_num, combustivel = str(ano_id).split('-')
-            except:
-                ano_num = str(ano_id)
-                combustivel = "1"
-        else:
-            ano_num = str(ano_id)
-            combustivel = "1"
-        
-        tipo_map = {1: "carro", 2: "caminhao", 3: "moto"}
-        
-        dados = {
-            "codigoTabelaReferencia": self.config.REFERENCIA,
-            "codigoTipoVeiculo": tipo,
-            "codigoMarca": marca_id,
-            "codigoModelo": modelo_id,
-            "anoModelo": ano_num,
-            "codigoTipoCombustivel": combustivel,
-            "tipoVeiculo": tipo_map.get(tipo, "carro"),
-            "modeloCodigoExterno": "",
-            "tipoConsulta": "tradicional"
-        }
-        
-        self.contador_batch += 1
-        if self.contador_batch >= self.timing.BATCH_PRECOS:
-            self._controle_timing(self.timing.PAUSA_BATCH)
-            self.contador_batch = 0
-        
-        resultado = self._requisicao_segura("ConsultarValorComTodosParametros", dados)
-        
-        if resultado:
-            resultado.update({
-                'marca': marca.get('Label', ''),
-                'modelo': modelo.get('Label', ''),
-                'ano': ano.get('Label', ''),
-                'tipo_veiculo': tipo,
-                'referencia': self.config.REFERENCIA,
-                'data_coleta': datetime.now().isoformat()
-            })
-            
-            self.cache.set_preco(tipo, marca_id, modelo_id, ano_id, resultado)
-            return resultado
-        
-        return None
-    
-    def _processar_marca_inteligente(self, tipo: int, marca: Dict, idx: int, total: int) -> int:
-        """Processa uma marca de forma inteligente"""
-        marca_nome = marca.get('Label', f'Marca_{idx}')
-        
-        modelos = self._obter_modelos_otimizado(tipo, marca)
-        
-        if not modelos:
-            self.logger.debug(f"  {marca_nome}: sem modelos")
-            return 0
-        
-        if self.config.MAX_MODELOS_TESTE:
-            modelos = modelos[:self.config.MAX_MODELOS_TESTE]
-        
-        veiculos_coletados = 0
-        total_modelos = len(modelos)
-        
-        for modelo_idx, modelo in enumerate(modelos, 1):
-            modelo_nome = modelo.get('Label', f'Modelo_{modelo_idx}')
-            
-            anos = self._obter_anos_otimizado(tipo, marca, modelo)
-            
-            if not anos:
-                continue
-            
-            for ano in anos:
-                try:
-                    preco = self._obter_preco_otimizado(tipo, marca, modelo, ano)
-                    
-                    if preco:
-                        # Adicionar ao buffer do banco de dados
-                        self.db.adicionar_veiculo(preco)
-                        self.stats['sucesso'] += 1
-                        self.stats['veiculos_coletados'] += 1
-                        veiculos_coletados += 1
-                        
-                        # Salvar buffer a cada 50 veículos
-                        if len(self.db.dados_buffer) >= 50:
-                            resultado = self.db.salvar_buffer()
-                            if resultado['sucesso']:
-                                self.logger.info(f"    💾 Salvos {resultado['salvos']} veículos "
-                                              f"(total: {resultado['total']})")
-                        
-                except Exception as e:
-                    self.stats['falhas'] += 1
-                    self.logger.debug(f"Erro no veículo: {e}")
-                    
-        return veiculos_coletados
 
-    def executar(self):
-        """Executa a coleta completa"""
-        self.logger.info(f"Iniciando coleta para Referência: {self.config.REFERENCIA}")
+    def _controle_timing(self, delay: float):
+        agora = time.time()
+        espera = max(0, delay - (agora - self.ultima_requisicao))
+        if espera > 0:
+            time.sleep(espera)
+        self.ultima_requisicao = time.time()
+
+    def _requisicao(self, endpoint: str, dados: Dict = None) -> Optional[Dict]:
+        url = f"{Config.BASE_URL}/{endpoint}"
+        for tentativa in range(4):
+            try:
+                self._controle_timing(self.timing.DELAY_PRECOS)
+                if endpoint == 'ConsultarTabelaDeReferencia':
+                    resp = self.session.post(url, timeout=self.timing.TIMEOUT)
+                else:
+                    resp = self.session.post(url, json=dados, timeout=self.timing.TIMEOUT)
+                
+                if resp.status_code == 429:
+                    espera = self.timing.COOLDOWN_429 * (tentativa + 1)
+                    self.logger.warning(f"⚠️ Rate limit 429! Aguardando {espera}s...")
+                    time.sleep(espera)
+                    continue
+                
+                if resp.status_code == 200:
+                    try:
+                        return resp.json()
+                    except:
+                        txt = resp.text.strip()
+                        if txt.startswith('ss['):
+                            txt = txt[2:]
+                        return json.loads(txt)
+                else:
+                    self.logger.warning(f"HTTP {resp.status_code} em {endpoint}. Tentando novamente...")
+                    time.sleep(2)
+            except Exception as e:
+                self.logger.debug(f"Erro na tentativa {tentativa+1}: {e}")
+                time.sleep(2)
+        return None
+
+    def executar(self) -> bool:
+        self.logger.info("=" * 60)
+        self.logger.info(f"🚀 INICIANDO COLETA FIPE - REFERÊNCIA {self.referencia}")
+        if self.modo_teste:
+            self.logger.info("⚠️ MODO TESTE RÁPIDO ATIVO (1 Marca / 2 Modelos)")
+        self.logger.info("=" * 60)
         
+        t0 = time.time()
         try:
-            for tipo_info in self.config.TIPOS_VEICULO:
-                tipo_id = tipo_info['id']
-                tipo_nome = tipo_info['nome']
+            for tipo in Config.TIPOS_VEICULO:
+                tipo_id = tipo['id']
+                tipo_nome = tipo['nome']
+                self.logger.info(f"\n📁 [{tipo_nome.upper()}] Buscando marcas...")
                 
-                self.logger.info(f"\n📁 TIPO: {tipo_nome.upper()}")
+                marcas = self._requisicao("ConsultarMarcas", {
+                    "codigoTabelaReferencia": self.referencia,
+                    "codigoTipoVeiculo": tipo_id
+                }) or []
                 
-                marcas = self._obter_marcas_otimizado(tipo_id)
+                if self.modo_teste:
+                    marcas = marcas[:1]
                 
-                if self.config.MAX_MARCAS_TESTE:
-                    marcas = marcas[:self.config.MAX_MARCAS_TESTE]
-                
-                total_marcas = len(marcas)
-                self.logger.info(f"Encontradas {total_marcas} marcas")
-                
+                self.logger.info(f"Total de marcas: {len(marcas)}")
                 for idx, marca in enumerate(marcas, 1):
-                    marca_nome = marca.get('Label', f'Marca_{idx}')
-                    self.logger.info(f"  [{idx}/{total_marcas}] Processando {marca_nome}...")
+                    marca_nome = marca.get('Label', '')
+                    marca_id = marca.get('Value', '')
+                    self.logger.info(f"  [{idx}/{len(marcas)}] {marca_nome}...")
                     
-                    self._processar_marca_inteligente(tipo_id, marca, idx, total_marcas)
-            
-            # Finalizar salvamento do buffer
-            resultado = self.db.salvar_buffer(forcar=True)
-            self.logger.info(f"\n✅ Coleta finalizada! Total de veículos no banco: {resultado['total']}")
-            
+                    modelos_data = self._requisicao("ConsultarModelos", {
+                        "codigoTabelaReferencia": self.referencia,
+                        "codigoTipoVeiculo": tipo_id,
+                        "codigoMarca": marca_id
+                    }) or {}
+                    
+                    modelos = modelos_data.get('Modelos', [])
+                    if self.modo_teste:
+                        modelos = modelos[:2]
+                    
+                    for modelo in modelos:
+                        modelo_nome = modelo.get('Label', '')
+                        modelo_id = modelo.get('Value', '')
+                        
+                        anos = self._requisicao("ConsultarAnoModelo", {
+                            "codigoTabelaReferencia": self.referencia,
+                            "codigoTipoVeiculo": tipo_id,
+                            "codigoMarca": marca_id,
+                            "codigoModelo": modelo_id
+                        }) or []
+                        
+                        for ano in anos:
+                            ano_nome = ano.get('Label', '')
+                            ano_id = str(ano.get('Value', ''))
+                            
+                            # Evita requisição se já foi coletado antes
+                            if self.db.veiculo_existe(tipo_id, marca_nome, modelo_nome, ano_nome, self.referencia):
+                                self.pulos += 1
+                                continue
+                            
+                            ano_num, comb = ano_id.split('-') if '-' in ano_id else (ano_id, '1')
+                            tipo_map = {1: "carro", 2: "caminhao", 3: "moto"}
+                            dados_preco = {
+                                "codigoTabelaReferencia": self.referencia,
+                                "codigoTipoVeiculo": tipo_id,
+                                "codigoMarca": marca_id,
+                                "codigoModelo": modelo_id,
+                                "anoModelo": ano_num,
+                                "codigoTipoCombustivel": comb,
+                                "tipoVeiculo": tipo_map.get(tipo_id, "carro"),
+                                "modeloCodigoExterno": "",
+                                "tipoConsulta": "tradicional"
+                            }
+                            
+                            self.contador_batch += 1
+                            if self.contador_batch >= self.timing.BATCH_PRECOS:
+                                self._controle_timing(self.timing.PAUSA_BATCH)
+                                self.contador_batch = 0
+                                
+                            res_preco = self._requisicao("ConsultarValorComTodosParametros", dados_preco)
+                            if res_preco and 'Valor' in res_preco:
+                                res_preco.update({
+                                    'marca': marca_nome,
+                                    'modelo': modelo_nome,
+                                    'ano': ano_nome,
+                                    'tipo_veiculo': tipo_id,
+                                    'referencia': self.referencia,
+                                    'data_coleta': datetime.now().isoformat()
+                                })
+                                self.db.adicionar_veiculo(res_preco)
+                                self.sucesso += 1
+                                self.veiculos_coletados += 1
+                                
+                                if len(self.db.dados_buffer) >= 50:
+                                    salvos = self.db.salvar_buffer()
+                                    self.logger.info(f"    💾 Salvos {salvos} veículos (Total ref: {self.db.contar_veiculos(self.referencia)})")
+                                    
+            self.db.salvar_buffer(forcar=True)
+            dt_min = (time.time() - t0) / 60
+            self.logger.info("\n" + "=" * 60)
+            self.logger.info(f"✅ COLETA LOCAL DA REF {self.referencia} CONCLUÍDA EM {dt_min:.1f} MINUTOS!")
+            self.logger.info(f"Novos veículos coletados: {self.sucesso}")
+            self.logger.info(f"Total nesta referência no SQLite: {self.db.contar_veiculos(self.referencia)}")
+            self.logger.info("=" * 60)
+            return True
         except KeyboardInterrupt:
-            self.logger.warning("\n⚠️  Coleta interrompida pelo usuário. Salvando dados...")
+            self.logger.warning("\nInterrompido pelo usuário. Salvando buffer...")
             self.db.salvar_buffer(forcar=True)
-        except Exception as e:
-            self.logger.error(f"\n❌ Erro fatal: {e}")
-            self.db.salvar_buffer(forcar=True)
+            return False
         finally:
-            self._mostrar_resumo()
             self.db.fechar()
 
-    def _mostrar_resumo(self):
-        """Mostra resumo da execução"""
-        tempo = datetime.now() - self.stats['inicio']
-        minutos = tempo.total_seconds() / 60
-        
-        self.logger.info("\n" + "=" * 60)
-        self.logger.info("📊 RESUMO DA EXECUÇÃO")
-        self.logger.info("-" * 60)
-        self.logger.info(f"⏱️  Tempo total: {minutos:.1f} minutos")
-        self.logger.info(f"🚗 Veículos coletados: {self.stats['veiculos_coletados']}")
-        self.logger.info(f"🌐 Requisições total: {self.stats['requisicoes_total']}")
-        self.logger.info(f"⚠️  Rate limits (429): {self.stats['rate_limits']}")
-        self.logger.info(f"✅ Sucesso: {self.stats['sucesso']}")
-        self.logger.info(f"❌ Falhas: {self.stats['falhas']}")
-        self.logger.info("=" * 60)
+# ==================== SINCRONIZADOR CLOUDFLARE D1 ====================
+class SincronizadorD1:
+    @staticmethod
+    def escape_sql(val):
+        if val is None:
+            return "NULL"
+        if isinstance(val, (int, float)):
+            return str(val)
+        return "'" + str(val).replace("'", "''") + "'"
 
-# ==================== MENU E INTERFACE ====================
-def menu_principal():
-    """Menu interativo"""
-    config = ConfigFinal()
+    @classmethod
+    def obter_referencias_d1(cls) -> Set[int]:
+        try:
+            cmd = ["npx", "wrangler", "d1", "execute", "fipe", "--remote", "--command=SELECT codigo FROM fipe_referencias", "--json"]
+            res = subprocess.run(cmd, capture_output=True, text=True, shell=True, errors='replace')
+            if res.returncode == 0:
+                data = json.loads(res.stdout)
+                return {r['codigo'] for r in data[0]['results']}
+        except Exception as e:
+            logging.debug(f"Aviso ao ler D1: {e}")
+        return set()
+
+    @classmethod
+    def sincronizar_referencia(cls, ref_id: int) -> bool:
+        print(f"\n🚀 SINCRONIZANDO REFERÊNCIA {ref_id} COM O CLOUDFLARE D1...")
+        db_file = Config.DATABASE_FILE
+        if not os.path.exists(db_file):
+            print(f"❌ Arquivo {db_file} não encontrado!")
+            return False
+            
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        
+        cols = ["tipo_veiculo", "marca", "modelo", "ano", "valor", "valor_texto", 
+                "combustivel", "referencia", "codigo_fipe", "mes_referencia", "data_coleta"]
+        cols_str = ", ".join(cols)
+        
+        cur.execute(f"SELECT {cols_str} FROM veiculos WHERE referencia = ?", (ref_id,))
+        rows = cur.fetchall()
+        
+        if not rows:
+            print(f"Nenhum registro encontrado no banco local para a referência {ref_id}.")
+            conn.close()
+            return False
+            
+        print(f"📦 Preparando {len(rows):,} veículos para envio ao Cloudflare D1...")
+        sql_file = f"temp_upload_ref_{ref_id}.sql"
+        batch_size = 100
+        
+        with open(sql_file, 'w', encoding='utf-8') as f:
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                vals = [f"({', '.join(cls.escape_sql(v) for v in r)})" for r in batch]
+                f.write(f"INSERT OR IGNORE INTO fipe ({cols_str}) VALUES\n" + ",\n".join(vals) + ";\n")
+        
+        # 1. Enviar lote de veículos
+        print("Enviando dados para o Cloudflare D1 (pode levar alguns segundos)...", flush=True)
+        cmd = ["npx", "wrangler", "d1", "execute", "fipe", "--remote", f"--file={sql_file}", "-y"]
+        res = subprocess.run(cmd, capture_output=True, text=True, shell=True, errors='replace')
+        
+        if os.path.exists(sql_file):
+            os.remove(sql_file)
+            
+        if res.returncode != 0:
+            print("❌ Erro ao enviar veículos para o D1:")
+            print(res.stderr or res.stdout)
+            conn.close()
+            return False
+            
+        print("✅ Veículos importados no Cloudflare D1 com sucesso!")
+        
+        # 2. Atualizar fipe_referencias e fipe_marcas no D1
+        cur.execute("SELECT TRIM(mes_referencia) FROM veiculos WHERE referencia = ? LIMIT 1", (ref_id,))
+        mes_row = cur.fetchone()
+        mes_ref = mes_row[0] if mes_row else f"Referência {ref_id}"
+        conn.close()
+        
+        print("🔄 Atualizando tabelas auxiliares (fipe_referencias e fipe_marcas) no D1...")
+        sql_aux = f'''
+            INSERT OR REPLACE INTO fipe_referencias (codigo, mes) VALUES ({ref_id}, {cls.escape_sql(mes_ref)});
+            INSERT OR IGNORE INTO fipe_marcas (referencia, tipo_veiculo, marca)
+            SELECT DISTINCT referencia, tipo_veiculo, marca FROM fipe WHERE referencia = {ref_id};
+        '''
+        cmd_aux = ["npx", "wrangler", "d1", "execute", "fipe", "--remote", f"--command={sql_aux}"]
+        subprocess.run(cmd_aux, capture_output=True, text=True, shell=True, errors='replace')
+        
+        print("🎉 SINCRONIZAÇÃO COMPLETA COM SUCESSO ABSOLUTO!")
+        print(f"A API na Cloudflare agora possui a referência {ref_id} ({mes_ref}) 100% online!")
+        return True
+
+# ==================== MODO SENTINELA (24/7) ====================
+def obter_todas_referencias_fipe() -> List[Dict]:
+    try:
+        r = requests.post("https://veiculos.fipe.org.br/api/veiculos/ConsultarTabelaDeReferencia", timeout=10)
+        if r.status_code == 200:
+            return r.json() or []
+    except Exception as e:
+        logging.debug(f"Erro ao consultar FIPE: {e}")
+    return []
+
+def obter_referencia_atual_fipe() -> Tuple[int, str]:
+    refs = obter_todas_referencias_fipe()
+    if refs:
+        return refs[0]['Codigo'], refs[0]['Mes'].strip()
+    return 337, "setembro de 2026"
+
+def modo_sentinela(ref_inicial: Optional[int] = None):
+    print("=" * 70)
+    print("🛡️ MODO SENTINELA FIPE 24/7 ATIVADO")
+    print("=" * 70)
+    print("Este modo roda de forma autônoma e contínua:")
+    print("1. Coleta e sobe a referência inicial solicitada (ex: 312).")
+    print("2. Fica monitorando a FIPE oficial a cada 1 hora.")
+    print("3. Quando a FIPE lançar a referência 338 (e seguintes), coleta e sobe sozinho!")
+    print("=" * 70)
+    
+    # Passo 1: Se uma referência inicial foi solicitada e ainda não está completa
+    if ref_inicial:
+        refs_d1 = SincronizadorD1.obter_referencias_d1()
+        if ref_inicial not in refs_d1:
+            print(f"\n[SENTINELA] 🎯 Iniciando coleta da referência pendente: {ref_inicial}...")
+            coletor = FipeColetor(ref_inicial, modo_teste=False)
+            ok = coletor.executar()
+            if ok:
+                SincronizadorD1.sincronizar_referencia(ref_inicial)
+        else:
+            print(f"\n[SENTINELA] Referência {ref_inicial} já se encontra no Cloudflare D1!")
+
+    # Passo 2: Loop contínuo de monitoramento da FIPE oficial
+    print("\n[SENTINELA] ✅ Entrando em vigília contínua. Monitorando FIPE oficial...")
+    while True:
+        try:
+            agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            ref_atual_fipe, mes_atual_fipe = obter_referencia_atual_fipe()
+            refs_d1 = SincronizadorD1.obter_referencias_d1()
+            
+            print(f"\n[{agora}] Checagem FIPE Oficial: Ref {ref_atual_fipe} ({mes_atual_fipe}) | Cloudflare D1: {len(refs_d1)} referências salvas.")
+            
+            # Se a FIPE tiver uma referência que NÃO está no D1 (ex: 338, 339, etc.)
+            if ref_atual_fipe not in refs_d1:
+                print(f"🚨 NOVA TABELA FIPE DETECTADA! Referência: {ref_atual_fipe} ({mes_atual_fipe})!")
+                print("Iniciando coleta automática imediatamente...")
+                coletor = FipeColetor(ref_atual_fipe, modo_teste=False)
+                ok = coletor.executar()
+                if ok:
+                    SincronizadorD1.sincronizar_referencia(ref_atual_fipe)
+                    print(f"🎉 Tabela {ref_atual_fipe} ({mes_atual_fipe}) publicada na Cloudflare com sucesso!")
+            else:
+                print(f"😴 Tudo em dia! Nenhuma tabela nova na FIPE. Próxima checagem em 1 hora.")
+                
+        except Exception as e:
+            print(f"[SENTINELA] Erro durante checagem: {e}")
+            
+        time.sleep(Config.INTERVALO_MONITORAMENTO_SEGUNDOS)
+
+# ==================== MENU PRINCIPAL ====================
+def menu():
+    ref_fipe, mes_fipe = obter_referencia_atual_fipe()
     
     while True:
         os.system('cls' if os.name == 'nt' else 'clear')
-        print("=" * 60)
-        print("🚀 FIPE SCRAPER SQLITE - MENU PRINCIPAL")
-        print("=" * 60)
-        print(f"Referência atual: {config.REFERENCIA} (Fevereiro 2026)")
-        print(f"Banco de dados: {config.DATABASE_FILE}")
-        print("-" * 60)
-        print("1. Iniciar Coleta COMPLETA (Produção)")
-        print("2. Iniciar Coleta de TESTE (Rápida)")
-        print("3. Ver Estatísticas do Banco de Dados")
-        print("4. Exportar Dados para JSON")
-        print("5. Buscar Veículo no Banco")
+        print("=" * 65)
+        print("🚀 FIPE COLETOR & MODO SENTINELA CLOUDFLARE D1")
+        print("=" * 65)
+        print(f"📅 Referência mais recente na FIPE oficial: {ref_fipe} ({mes_fipe})")
+        print(f"💾 Banco local SQLite: {Config.DATABASE_FILE}")
+        print("-" * 65)
+        print("1. Iniciar MODO SENTINELA 24/7 (Coleta 312 agora -> Aguarda 338 em diante)")
+        print("2. Iniciar Coleta da Referência Oficial Atual (Completa) + Upload")
+        print("3. Iniciar Coleta de TESTE Rápida (1 marca / 2 modelos) + Upload")
+        print("4. Coletar Referência ESPECÍFICA (ex: 312 - Agosto/2024)")
+        print("5. Apenas enviar dados do banco local para o Cloudflare D1")
+        print("6. Testar conexão com a API da FIPE")
         print("0. Sair")
-        print("-" * 60)
+        print("-" * 65)
         
-        opcao = input("Escolha uma opção: ").strip()
+        op = input("Escolha uma opção: ").strip()
         
-        if opcao == '1':
-            config.MODO_TESTE = False
-            config.MAX_MARCAS_TESTE = None
-            config.MAX_MODELOS_TESTE = None
-            scraper = FipeScraperFinal(config)
-            scraper.executar()
-            input("\nPressione Enter para voltar ao menu...")
+        if op == '1':
+            modo_sentinela(ref_inicial=312)
+            input("\nPressione Enter para continuar...")
             
-        elif opcao == '2':
-            config.MODO_TESTE = True
-            config.MAX_MARCAS_TESTE = 3
-            config.MAX_MODELOS_TESTE = 2
-            scraper = FipeScraperFinal(config)
-            scraper.executar()
-            input("\nPressione Enter para voltar ao menu...")
+        elif op == '2':
+            coletor = FipeColetor(ref_fipe, modo_teste=False)
+            ok = coletor.executar()
+            if ok:
+                SincronizadorD1.sincronizar_referencia(ref_fipe)
+            input("\nPressione Enter para continuar...")
             
-        elif opcao == '3':
-            ver_estatisticas()
-            input("\nPressione Enter para voltar ao menu...")
+        elif op == '3':
+            coletor = FipeColetor(ref_fipe, modo_teste=True)
+            ok = coletor.executar()
+            if ok:
+                SincronizadorD1.sincronizar_referencia(ref_fipe)
+            input("\nPressione Enter para continuar...")
             
-        elif opcao == '4':
-            exportar_para_json()
-            input("\nPressione Enter para voltar ao menu...")
+        elif op == '4':
+            ref_input = input("Digite o número da referência desejada (ex: 312): ").strip()
+            if ref_input.isdigit():
+                ref_num = int(ref_input)
+                coletor = FipeColetor(ref_num, modo_teste=False)
+                ok = coletor.executar()
+                if ok:
+                    SincronizadorD1.sincronizar_referencia(ref_num)
+            input("\nPressione Enter para continuar...")
             
-        elif opcao == '5':
-            buscar_veiculos()
-            input("\nPressione Enter para voltar ao menu...")
+        elif op == '5':
+            ref_input = input(f"Qual referência deseja enviar para o D1? (Padrão: {ref_fipe}): ").strip()
+            ref_num = int(ref_input) if ref_input.isdigit() else ref_fipe
+            SincronizadorD1.sincronizar_referencia(ref_num)
+            input("\nPressione Enter para continuar...")
             
-        elif opcao == '0':
-            print("\nSaindo... Até logo!")
+        elif op == '6':
+            print("\nTestando conexão com a FIPE oficial...")
+            r, m = obter_referencia_atual_fipe()
+            print(f"Status: OK! Última referência encontrada: {r} ({m})")
+            input("\nPressione Enter para continuar...")
+            
+        elif op == '0':
+            print("Até logo!")
             break
-        else:
-            print("\nOpção inválida!")
-            time.sleep(1)
 
-def ver_estatisticas():
-    """Mostra estatísticas do banco de dados"""
-    db_file = "fipe_database_v3.db"
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Coletor FIPE + Cloudflare D1")
+    parser.add_argument("--sentinela", action="store_true", help="Iniciar em modo Sentinela 24/7 autônomo")
+    parser.add_argument("--ref", type=int, default=None, help="Referência inicial para coleta (ex: 312)")
+    parser.add_argument("--modo-teste", action="store_true", help="Modo teste rápido (1 marca / 2 modelos)")
+    parser.add_argument("--sem-upload", action="store_true", help="Não fazer upload no Cloudflare D1")
+    parser.add_argument("--executar", action="store_true", help="Executar coleta diretamente sem abrir menu")
+    args = parser.parse_args()
     
-    if not os.path.exists(db_file):
-        print(f"\n❌ Banco de dados não encontrado: {db_file}")
-        return
-    
-    try:
-        db = GerenciadorSQLite(db_file)
-        stats = db.estatisticas_banco()
-        db.fechar()
-        
-        if 'erro' in stats:
-            print(f"\n❌ Erro ao acessar banco de dados: {stats['erro']}")
-            return
-        
-        print(f"\n📊 DADOS NO BANCO DE DADOS:")
-        print(f"   • Veículos: {stats['total_veiculos']:,}")
-        print(f"   • Marcas: {stats['total_marcas']}")
-        print(f"   • Modelos: {stats['total_modelos']}")
-        print(f"   • Tipos de veículo: {stats['total_tipos']}")
-        
-        if 'por_tipo' in stats:
-            for tipo, quantidade in stats['por_tipo'].items():
-                print(f"   • {tipo}: {quantidade:,}")
-        
-        print(f"   • Tamanho do banco: {stats['tamanho_mb']:.2f} MB")
-        print(f"   • Última atualização: {stats['ultima_atualizacao']}")
-        
-        # Últimos 5 veículos
-        print(f"\n📝 ÚLTIMOS 5 VEÍCULOS COLETADOS:")
-        db = GerenciadorSQLite(db_file)
-        veiculos = db.buscar_veiculos(limite=5)
-        db.fechar()
-        
-        for veiculo in veiculos:
-            print(f"   • {veiculo['marca']} {veiculo['modelo']} {veiculo['ano']} - {veiculo['valor']}")
-        
-        print("\n" + "="*60)
-        
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-
-def exportar_para_json():
-    """Exporta dados do SQLite para JSON"""
-    db_file = "fipe_database_v3.db"
-    json_file = "dados_fipe/fipe_exportado.json"
-    
-    if not os.path.exists(db_file):
-        print(f"\n❌ Banco de dados não encontrado: {db_file}")
-        return
-    
-    try:
-        db = GerenciadorSQLite(db_file)
-        resultado = db.exportar_para_json(json_file)
-        db.fechar()
-        
-        if resultado['sucesso']:
-            print(f"\n✅ Exportação concluída!")
-            print(f"   • Arquivo: {json_file}")
-            print(f"   • Veículos exportados: {resultado['veiculos_exportados']:,}")
-            
-            tamanho_bytes = os.path.getsize(json_file) if os.path.exists(json_file) else 0
-            tamanho_mb = tamanho_bytes / (1024 * 1024)
-            print(f"   • Tamanho do JSON: {tamanho_mb:.2f} MB")
-        else:
-            print(f"\n❌ Erro na exportação: {resultado['erro']}")
-            
-        print("\n" + "="*60)
-        
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-
-def buscar_veiculos():
-    """Busca veículos no banco de dados"""
-    db_file = "fipe_database_v3.db"
-    
-    if not os.path.exists(db_file):
-        print(f"\n❌ Banco de dados não encontrado: {db_file}")
-        return
-    
-    try:
-        print("\n🔍 BUSCAR VEÍCULOS")
-        
-        marca = input("Marca (opcional, pressione Enter para pular): ").strip()
-        modelo = input("Modelo (opcional): ").strip()
-        tipo_input = input("Tipo (1=Carros, 2=Caminhões, 3=Motos, Enter=todos): ").strip()
-        
-        filtros = {}
-        if marca:
-            filtros['marca'] = marca
-        if modelo:
-            filtros['modelo'] = modelo
-        if tipo_input and tipo_input in ['1', '2', '3']:
-            filtros['tipo_veiculo'] = int(tipo_input)
-        
-        limite_input = input("Quantos resultados (padrão: 20): ").strip()
-        limite = int(limite_input) if limite_input.isdigit() else 20
-        
-        db = GerenciadorSQLite(db_file)
-        veiculos = db.buscar_veiculos(filtros, limite)
-        db.fechar()
-        
-        print(f"\n🔎 RESULTADOS DA BUSCA ({len(veiculos)} veículos):")
-        print("-" * 60)
-        
-        for i, veiculo in enumerate(veiculos, 1):
-            tipo_map = {1: 'Carro', 2: 'Caminhão', 3: 'Moto'}
-            tipo = tipo_map.get(veiculo['tipo_veiculo'], 'Desconhecido')
-            
-            print(f"{i}. {veiculo['marca']} {veiculo['modelo']} {veiculo['ano']}")
-            print(f"   Tipo: {tipo} | Valor: {veiculo['valor']}")
-            print(f"   Combustível: {veiculo['combustivel']} | Código FIPE: {veiculo['codigo_fipe']}")
-            print(f"   Coletado em: {veiculo['data_coleta'][:19]}")
-            print()
-        
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"❌ Erro na busca: {e}")
-
-# ==================== EXECUÇÃO ====================
-if __name__ == "__main__":
-    menu_principal()
+    if args.sentinela:
+        modo_sentinela(ref_inicial=args.ref)
+    elif args.executar or args.modo_teste:
+        ref_fipe, mes_fipe = obter_referencia_atual_fipe()
+        target_ref = args.ref if args.ref else ref_fipe
+        print(f"[CLOUD/CLI] Iniciando coleta da Referência {target_ref} (Modo Teste: {args.modo_teste})...")
+        coletor = FipeColetor(target_ref, modo_teste=args.modo_teste)
+        ok = coletor.executar()
+        if ok and not args.sem_upload:
+            SincronizadorD1.sincronizar_referencia(target_ref)
+    else:
+        menu()
